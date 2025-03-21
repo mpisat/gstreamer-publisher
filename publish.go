@@ -148,13 +148,24 @@ func (p *Publisher) Stop() {
 func (p *Publisher) messageWatch(msg *gst.Message) bool {
 	switch msg.Type() {
 	case gst.MessageEOS:
-		// EOS received - close and return
-		logger.Infow("EOS received, stopping pipeline")
-		p.Stop()
-		return false
+		logger.Infow("EOS received, looping pipeline")
+		// Seek to the start of the file
+		success := p.pipeline.SeekSimple(0, gst.FormatTime, gst.SeekFlagFlush|gst.SeekFlagKeyUnit)
+		if !success {
+			logger.Errorw("Failed to seek pipeline to start", nil)
+			p.Stop()
+			return false
+		}
+		// Reset track ended states to prevent unpublishing
+		if p.videoTrack != nil {
+			p.videoTrack.isEnded.Store(false)
+		}
+		if p.audioTrack != nil {
+			p.audioTrack.isEnded.Store(false)
+		}
+		return true // Continue running the pipeline
 
 	case gst.MessageError:
-		// handle error if possible, otherwise close and return
 		logger.Infow("pipeline failure", "error", msg)
 		p.Stop()
 		return false
