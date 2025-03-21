@@ -27,6 +27,7 @@ import (
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 
+	"github.com/livekit/protocol/logger"
 	lksdk "github.com/livekit/server-sdk-go/v2"
 )
 
@@ -87,12 +88,17 @@ func (t *publisherTrack) IsEnded() bool {
 	return t.isEnded.Load()
 }
 
-// callback function when EOS is received
+// Modify the handleEOS function in track.go to prevent track unpublishing
+
 func (t *publisherTrack) handleEOS(_ *app.Sink) {
+	// Mark the track as ended, but don't unpublish
 	t.isEnded.Store(true)
-	if t.onEOS != nil {
-		t.onEOS()
-	}
+
+	// Log the EOS event
+	logger.Debugw("appsink EOS received", "mimeType", t.mimeType)
+
+	// Don't call onEOS here as we don't want to unpublish the track
+	// The messageWatch function in publish.go will handle resetting isEnded
 }
 
 // callback function when new sample is ready
