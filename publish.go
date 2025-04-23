@@ -19,7 +19,10 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/go-gst/go-glib/glib"
 	"github.com/go-gst/go-gst/gst"
@@ -54,6 +57,15 @@ type Publisher struct {
 	videoTrack *publisherTrack
 	audioTrack *publisherTrack
 	room       *lksdk.Room
+
+	// For managing shutdown
+	shutdownCh   chan struct{}
+	restartCh    chan struct{}
+	mu           sync.Mutex
+	shuttingDown bool
+
+	// Track reconnection attempts
+	reconnecting atomic.Bool
 }
 
 type elementTarget struct {
@@ -65,84 +77,255 @@ type elementTarget struct {
 
 func NewPublisher(params PublisherParams) *Publisher {
 	return &Publisher{
-		params: params,
+		params:     params,
+		shutdownCh: make(chan struct{}),
+		restartCh:  make(chan struct{}, 1),
 	}
 }
 
 func (p *Publisher) Start() error {
-	if err := p.initialize(); err != nil {
-		return err
-	}
-
-	// TODO: connect at the same time in parallel as spinning up pipeline
-	cb := lksdk.NewRoomCallback()
-	cb.OnDisconnected = func() {
-		// TODO: stop publishing and exit
-	}
-	p.room = lksdk.NewRoom(cb)
-	err := p.room.JoinWithToken(p.params.URL, p.params.Token,
-		lksdk.WithAutoSubscribe(false),
-	)
-	if err != nil {
-		return err
-	}
-
-	// publish tracks if sinks are set up
-	if p.videoTrack != nil {
-		pub, err := p.room.LocalParticipant.PublishTrack(p.videoTrack.track, &lksdk.TrackPublicationOptions{
-			Source: livekit.TrackSource_CAMERA,
-		})
-		if err != nil {
-			return err
-		}
-		p.videoTrack.publication = pub
-		p.videoTrack.onEOS = func() {
-			_ = p.room.LocalParticipant.UnpublishTrack(pub.SID())
-		}
-	}
-
-	if p.audioTrack != nil {
-		pub, err := p.room.LocalParticipant.PublishTrack(p.audioTrack.track, &lksdk.TrackPublicationOptions{
-			Source: livekit.TrackSource_MICROPHONE,
-		})
-		if err != nil {
-			return err
-		}
-		p.audioTrack.publication = pub
-		p.audioTrack.onEOS = func() {
-			_ = p.room.LocalParticipant.UnpublishTrack(pub.SID())
-		}
-	}
-
-	if err := p.pipeline.Start(); err != nil {
-		return err
-	}
-
+	// Set up signal handling once for the lifetime of the program
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	go func() {
 		<-sigChan
+		p.mu.Lock()
+		p.shuttingDown = true
+		p.mu.Unlock()
+		close(p.shutdownCh)
 		p.Stop()
+		os.Exit(0)
 	}()
 
-	p.loop.Run()
-	return nil
+	// Main reconnection loop
+	for {
+		logger.Infow("starting publisher session")
+
+		// Initialize everything from scratch
+		if err := p.initialize(); err != nil {
+			logger.Infow("initialization failed, retrying in 3 seconds", "error", err)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		// Set up room connection with callbacks
+		cb := lksdk.NewRoomCallback()
+
+		// Handle explicit disconnections
+		cb.OnDisconnected = func() {
+			logger.Infow("disconnected from LiveKit, triggering restart")
+			select {
+			case p.restartCh <- struct{}{}:
+			default:
+				// Already has a pending restart
+			}
+		}
+
+		// Handle reconnection attempts
+		cb.OnReconnecting = func() {
+			logger.Infow("reconnecting to LiveKit, tracking reconnection state")
+			p.reconnecting.Store(true)
+		}
+
+		// When reconnected, we'll also trigger a restart to ensure tracks are republished
+		cb.OnReconnected = func() {
+			if p.reconnecting.Load() {
+				logger.Infow("reconnected to LiveKit, forcing a full restart to republish tracks")
+				p.reconnecting.Store(false)
+				select {
+				case p.restartCh <- struct{}{}:
+				default:
+					// Already has a pending restart
+				}
+			}
+		}
+
+		p.room = lksdk.NewRoom(cb)
+		err := p.room.JoinWithToken(p.params.URL, p.params.Token,
+			lksdk.WithAutoSubscribe(false),
+		)
+		if err != nil {
+			logger.Infow("room join failed, retrying in 3 seconds", "error", err)
+			p.cleanup()
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		// Track that we've successfully connected
+		logger.Infow("successfully connected to LiveKit room",
+			"roomID", p.room.SID(),
+			"participantID", p.room.LocalParticipant.SID())
+
+		// Publish tracks
+		if p.videoTrack != nil {
+			pub, err := p.room.LocalParticipant.PublishTrack(p.videoTrack.track, &lksdk.TrackPublicationOptions{
+				Source: livekit.TrackSource_CAMERA,
+			})
+			if err != nil {
+				logger.Infow("failed to publish video track, retrying session", "error", err)
+				p.cleanup()
+				time.Sleep(3 * time.Second)
+				continue
+			}
+			p.videoTrack.publication = pub
+			logger.Infow("published video track", "trackID", pub.SID())
+			p.videoTrack.onEOS = func() {
+				_ = p.room.LocalParticipant.UnpublishTrack(pub.SID())
+			}
+		}
+
+		if p.audioTrack != nil {
+			pub, err := p.room.LocalParticipant.PublishTrack(p.audioTrack.track, &lksdk.TrackPublicationOptions{
+				Source: livekit.TrackSource_MICROPHONE,
+			})
+			if err != nil {
+				logger.Infow("failed to publish audio track, retrying session", "error", err)
+				p.cleanup()
+				time.Sleep(3 * time.Second)
+				continue
+			}
+			p.audioTrack.publication = pub
+			logger.Infow("published audio track", "trackID", pub.SID())
+			p.audioTrack.onEOS = func() {
+				_ = p.room.LocalParticipant.UnpublishTrack(pub.SID())
+			}
+		}
+
+		// Start the pipeline
+		if err := p.pipeline.Start(); err != nil {
+			logger.Infow("failed to start pipeline, retrying", "error", err)
+			p.cleanup()
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		// Set up watchdog to monitor connection status
+		go p.startConnectionWatchdog()
+
+		// Start a goroutine to watch for restart signals
+		restartComplete := make(chan struct{})
+		go func() {
+			select {
+			case <-p.restartCh:
+				logger.Infow("restart requested, stopping current session")
+				// First, try to cleanly disconnect from the room
+				if p.room != nil {
+					p.room.Disconnect()
+				}
+				// Then, perform full cleanup
+				p.cleanup()
+				close(restartComplete)
+			case <-p.shutdownCh:
+				// Just exit the goroutine on shutdown
+			}
+		}()
+
+		// Run the main loop until it exits
+		p.loop.Run()
+
+		// Wait for restart to complete if it was triggered
+		<-restartComplete
+
+		// Check if we're shutting down
+		p.mu.Lock()
+		shuttingDown := p.shuttingDown
+		p.mu.Unlock()
+		if shuttingDown {
+			return nil
+		}
+
+		// Wait before reconnecting
+		logger.Infow("session ended, reconnecting in 3 seconds")
+		time.Sleep(3 * time.Second)
+	}
+}
+
+// Periodically check connection status as a backup detection mechanism
+func (p *Publisher) startConnectionWatchdog() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// If reconnection is in progress, check if we need to trigger restart
+			if p.reconnecting.Load() {
+				logger.Infow("connection still in reconnecting state, forcing restart")
+				select {
+				case p.restartCh <- struct{}{}:
+					p.reconnecting.Store(false)
+				default:
+					// Already has a pending restart
+				}
+			}
+
+			// Check if room connection is active
+			// Instead of checking connection quality (which isn't available),
+			// check if we've been in reconnecting state for too long
+			if p.room != nil && p.reconnecting.Load() {
+				logger.Infow("detected prolonged reconnection state, triggering restart")
+				select {
+				case p.restartCh <- struct{}{}:
+				default:
+					// Already has a pending restart
+				}
+			}
+		case <-p.shutdownCh:
+			return
+		}
+	}
+}
+
+func (p *Publisher) cleanup() {
+	logger.Infow("performing cleanup")
+	// Make sure to shutdown pipeline first
+	if p.pipeline != nil {
+		logger.Infow("setting pipeline to NULL state")
+		p.pipeline.BlockSetState(gst.StateNull)
+		p.pipeline = nil
+	}
+
+	// Unpublish tracks
+	if p.room != nil && p.room.LocalParticipant != nil {
+		if p.videoTrack != nil && p.videoTrack.publication != nil {
+			logger.Infow("unpublishing video track",
+				"trackID", p.videoTrack.publication.SID())
+			_ = p.room.LocalParticipant.UnpublishTrack(p.videoTrack.publication.SID())
+		}
+		if p.audioTrack != nil && p.audioTrack.publication != nil {
+			logger.Infow("unpublishing audio track",
+				"trackID", p.audioTrack.publication.SID())
+			_ = p.room.LocalParticipant.UnpublishTrack(p.audioTrack.publication.SID())
+		}
+	}
+
+	// Disconnect room connection
+	if p.room != nil {
+		logger.Infow("disconnecting from LiveKit room")
+		p.room.Disconnect()
+		p.room = nil
+	}
+
+	// Quit main loop
+	if p.loop != nil {
+		logger.Infow("quitting main loop")
+		p.loop.Quit()
+		p.loop = nil
+	}
+
+	// Clear track references
+	p.videoTrack = nil
+	p.audioTrack = nil
+
+	// Reset reconnection state
+	p.reconnecting.Store(false)
+
+	logger.Infow("cleanup complete")
 }
 
 func (p *Publisher) Stop() {
 	logger.Infow("stopping publisher..")
-	if p.pipeline != nil {
-		p.pipeline.BlockSetState(gst.StateNull)
-		p.pipeline = nil
-	}
-	if p.room != nil {
-		p.room.Disconnect()
-		p.room = nil
-	}
-	if p.loop != nil {
-		p.loop.Quit()
-		p.loop = nil
-	}
+	p.cleanup()
 }
 
 func (p *Publisher) messageWatch(msg *gst.Message) bool {
@@ -152,8 +335,13 @@ func (p *Publisher) messageWatch(msg *gst.Message) bool {
 		// Seek to the start of the file
 		success := p.pipeline.SeekSimple(0, gst.FormatTime, gst.SeekFlagFlush|gst.SeekFlagKeyUnit)
 		if !success {
-			logger.Errorw("Failed to seek pipeline to start", nil)
-			p.Stop()
+			logger.Infow("Failed to seek pipeline to start, triggering restart")
+			// Trigger restart
+			select {
+			case p.restartCh <- struct{}{}:
+			default:
+				// Channel already has a pending restart
+			}
 			return false
 		}
 		// Reset track ended states to prevent unpublishing
@@ -166,8 +354,14 @@ func (p *Publisher) messageWatch(msg *gst.Message) bool {
 		return true // Continue running the pipeline
 
 	case gst.MessageError:
-		logger.Infow("pipeline failure", "error", msg)
-		p.Stop()
+		gerr := msg.ParseError()
+		logger.Infow("pipeline error, triggering restart", "error", gerr)
+		// Trigger restart
+		select {
+		case p.restartCh <- struct{}{}:
+		default:
+			// Channel already has a pending restart
+		}
 		return false
 
 	case gst.MessageTag, gst.MessageStateChanged, gst.MessageLatency, gst.MessageAsyncDone, gst.MessageStreamStatus, gst.MessageElement:
@@ -181,9 +375,6 @@ func (p *Publisher) messageWatch(msg *gst.Message) bool {
 }
 
 func (p *Publisher) initialize() error {
-	if p.pipeline != nil {
-		return nil
-	}
 	gst.Init(nil)
 	p.loop = glib.NewMainLoop(glib.MainContextDefault(), false)
 	pipeline, err := gst.NewPipelineFromString(p.params.PipelineString)
